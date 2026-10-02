@@ -12,6 +12,9 @@
   标签义务（obligations）、警告（warnings）与违规（violations）
 - 评估请求**绑定配方版本**，并可显式绑定 `rule_set_code/version`，
   在不可变规则快照上**重放**；通过幂等键支持**幂等重放**
+- **整改预演**（dry-run）：在内存中按候选替代清单等质量替换原料的全部出现位置，
+  用指定规则集快照重算含量、交叉接触与合规结果，返回**消除全部 `prohibit`
+  违规**的唯一最省方案；不改动任何持久化数据
 - 输入不完整时返回**最小缺失集合**（minimal missing set）
 
 ---
@@ -424,6 +427,143 @@ bash examples/concurrency_check.sh # 默认 10 轮 × 3 组竞速，可用 ROUND
 `tests/test_recipe_version_concurrency.py`（用 SQLAlchemy `load` 事件在
 端点的读窗口内注入并发提交，精确复现「删除原行 → 同号新建草稿」等竞速交错）。
 
+### 3.9 过敏原整改预演（替代方案 dry-run）
+
+`POST /remediations` 在**内存**中演练原料替代：请求给出法域、已发布配方版本、
+不可变规则集版本，以及候选替代清单（**每种原料至多一项不同的替代原料**）。
+该端点与其余 API 同属 `api` 服务——`docker compose up --build`（见第 1 节）
+启动后即可访问 `http://localhost:8000/remediations`，无需额外配置。
+服务沿用现有的嵌套展开取得叶子用量，按原料代码把某项替代应用到该原料的
+**全部出现位置**（等质量替换，批次总质量不变），再用指定的规则集快照重算
+含量、交叉接触与合规结果，返回**消除全部 `prohibit` 违规**的方案、替换总质量
+及前后义务 / 警告 / 违规：
+
+- 候选方案是替代清单的子集；多方案均可行时，先按**替换总质量最小**、再按
+  **已排序替换对 `(ingredient, substitute)` 的代码字典序**取唯一结果；
+- 原配方已无 `prohibit` 违规时返回**零替换方案**（`status=compliant`）；
+- 候选子集都无法消除全部违规时返回 `200` + `status=no_solution`
+  （`plan`/`after` 为 `null`，`before` 保留现状评估）；
+- 预演**不写入任何数据**：配方、规则、规则集与评估历史均不受影响，
+  也不产生评估记录或占用幂等键。
+
+沿用 3.1–3.5 的场景（`cake` v1 绑定 `eu-pack` v1，gluten 71428.571429 ppm 触发
+`gluten-prohibit`），先登记一个不含麸质的替代原料，再请求整改：
+
+```bash
+curl -X POST http://localhost:8000/ingredients -H 'Content-Type: application/json' \
+  -d '{"code":"rice_flour","name":"Rice Flour"}'
+
+curl -X POST http://localhost:8000/remediations -H 'Content-Type: application/json' \
+  -d '{
+        "recipe_code": "cake",
+        "recipe_version": 1,
+        "jurisdiction": "EU",
+        "rule_set_code": "eu-pack",
+        "rule_set_version": 1,
+        "substitutions": [
+          {"ingredient": "wheat_flour", "substitute": "rice_flour"}
+        ]
+      }'
+```
+
+响应（与实现逐字一致的真实计算结果，重复结构以 `...` 省略）：
+
+```json
+{
+  "recipe": {"code": "cake", "version": 1},
+  "jurisdiction": "EU",
+  "rule_set": {"code": "eu-pack", "version": 1,
+               "digest": "f04ec59a8964624a180fd2748a234b975d6f335826becac0426bdab1b5274052"},
+  "status": "remediated",
+  "plan": {
+    "substitutions": [
+      {"ingredient": "wheat_flour", "substitute": "rice_flour",
+       "substituted_mass_g": 1000.0}
+    ],
+    "substituted_mass_g": 1000.0
+  },
+  "before": {
+    "status": "completed",
+    "total_mass_g": 1400.0,
+    "resolved_recipes": [{"code": "cake", "version": 1}, {"code": "filling", "version": 1}],
+    "allergens": [
+      {"allergen": "gluten",    "concentration_ppm": 71428.571429,  "concentration_percent": 7.142857},
+      {"allergen": "tree_nuts", "concentration_ppm": 142857.142857, "concentration_percent": 14.285714}
+    ],
+    "obligations": [
+      {"allergen": "gluten", "rule_code": "gluten-declare", "action": "declare",
+       "source": "contains", "threshold_ppm": 0.0, "concentration_ppm": 71428.571429,
+       "trigger_paths": [{"path": ["cake@v1", "wheat_flour"], "...": "..."}]},
+      {"allergen": "tree_nuts", "rule_code": "tree-nuts-declare", "...": "..."}
+    ],
+    "warnings": [
+      {"allergen": "peanut", "rule_code": "peanut-may-contain", "action": "warning",
+       "source": "cross_contact", "...": "..."}
+    ],
+    "violations": [
+      {"allergen": "gluten", "rule_code": "gluten-prohibit", "action": "prohibit",
+       "source": "contains", "threshold_ppm": 20.0, "concentration_ppm": 71428.571429,
+       "trigger_paths": [{"path": ["cake@v1", "wheat_flour"], "ingredient": "wheat_flour",
+                          "ingredient_mass_g": 1000.0, "allergen_mass_g": 100.0,
+                          "contribution_ppm": 71428.571429}]}
+    ],
+    "unregulated_allergens": []
+  },
+  "after": {
+    "status": "completed",
+    "total_mass_g": 1400.0,
+    "allergens": [
+      {"allergen": "tree_nuts", "concentration_ppm": 142857.142857, "concentration_percent": 14.285714}
+    ],
+    "obligations": [
+      {"allergen": "tree_nuts", "rule_code": "tree-nuts-declare", "...": "..."}
+    ],
+    "warnings": [
+      {"allergen": "peanut", "rule_code": "peanut-may-contain", "...": "..."}
+    ],
+    "violations": [],
+    "unregulated_allergens": []
+  }
+}
+```
+
+1 kg 小麦粉被等质量替换为米粉后，gluten 彻底消失（其 `declare` 义务也随之
+解除），杏仁粉带入的 tree_nuts 义务与 peanut 交叉接触警告保持不变，批次总质量
+不变。替代原料自身的含量与交叉接触标记会一并重算（例如换成带
+`cross_contact` 的原料，`after.warnings` 会出现对应条目，触发路径的叶子也
+显示替代后的原料代码）。
+
+无解示例：把替代换成仍含 8% 麸质的斯佩尔特小麦粉（`spelt_flour`），响应为
+`200` 且：
+
+```json
+{
+  "recipe": {"code": "cake", "version": 1},
+  "jurisdiction": "EU",
+  "rule_set": {"code": "eu-pack", "version": 1,
+               "digest": "f04ec59a8964624a180fd2748a234b975d6f335826becac0426bdab1b5274052"},
+  "status": "no_solution",
+  "plan": null,
+  "before": {"violations": [{"allergen": "gluten", "rule_code": "gluten-prohibit", "...": "..."}]},
+  "after": null
+}
+```
+
+错误语义与评估接口一致，另有四项替代校验（均为 `422`）：
+
+| 情况 | `detail.code` |
+| ---- | ---- |
+| 同一原料出现两项替代（重复映射） | `DUPLICATE_SUBSTITUTION` |
+| 替代原料与被替代原料相同 | `IDENTICAL_SUBSTITUTION` |
+| 被替代原料未在配方中出现 | `INGREDIENT_NOT_IN_RECIPE` |
+| 替代原料未登记 | `UNKNOWN_SUBSTITUTE` |
+
+配方与规则集引用错误**沿用现有响应**：`RECIPE_NOT_FOUND` /
+`RECIPE_VERSION_NOT_FOUND`（404）、`VERSION_NOT_PUBLISHED` /
+`INCOMPLETE_INPUT` / `RECIPE_CYCLE` / `EMPTY_RECIPE`（422）、
+`RULE_SET_NOT_FOUND` / `RULE_SET_VERSION_NOT_FOUND`（404）、
+`RULE_SET_JURISDICTION_MISMATCH`（422）。
+
 ## 4. API 一览
 
 | 方法 | 路径 | 说明 |
@@ -446,6 +586,7 @@ bash examples/concurrency_check.sh # 默认 10 轮 × 3 组竞速，可用 ROUND
 | GET  | `/recipes…` | 查询配方及版本 |
 | POST | `/evaluations` | 评估（需 `Idempotency-Key` 头或 `idempotency_key`；可选 `rule_set_code`+`rule_set_version`） |
 | GET  | `/evaluations`、`/evaluations/{id}` | 查询（可按 `rule_set_code`/`rule_set_version` 过滤，固定返回摘要、配方版本与结果） |
+| POST | `/remediations` | 整改预演（内存 dry-run）：返回消除全部 `prohibit` 违规的唯一最省替代方案、替换总质量与前后义务/警告/违规；不写库 |
 | GET  | `/units`、`/health`、`/` | 元信息 |
 
 ## 5. 评估语义
@@ -519,6 +660,12 @@ uvicorn app.main:app --reload
   旧结果仅新增恒定为 `null` 的 `rule_set` 字段。升级时自动为已有库补齐新列。
 - **最小缺失集合**：展开过程收集全部直接缺失引用（去重、稳定排序）后一次性
   返回 `422 INCOMPLETE_INPUT`；失败评估不占用幂等键。
+- **整改预演**：`POST /remediations` 复用同一套展开与规则匹配内核，在内存中
+  对叶子集合应用候选替代（按原料代码等质量替换全部出现位置，替代原料自身的
+  含量与交叉接触一并重算），枚举替代清单的全部子集找出消除所有 `prohibit`
+  违规的方案；按（替换总质量， 已排序替换对字典序）取唯一胜者，已合规返回零
+  替换方案，无解返回 `status=no_solution`。全程只读——配方、规则、规则集与
+  评估历史均不被改写，也不产生评估记录。
 - **稳定输出**：所有列表确定性排序，数值统一 `round(., 6)`，便于审计与 diff。
 
 ## 9. 目录结构
@@ -528,14 +675,15 @@ app/
   main.py                 # FastAPI 入口、建表/增量列迁移、统一错误格式
   config.py / db.py       # DATABASE_URL、引擎与会话
   models.py               # Ingredient / Rule / RuleSet(+Version) / Recipe(+Version) / Evaluation
-  schemas.py              # 请求校验（单位、编码规范化、>100% 拦截、base_version/绑定）
+  schemas.py              # 请求校验（单位、编码规范化、>100% 拦截、base_version/绑定/替代清单）
   units.py                # 质量(g)与浓度(ppm)换算
   services/
     expansion.py          # 递归展开、循环检测、最小缺失集合
-    evaluation.py         # 过敏原累积、规则/快照匹配、稳定排序输出
+    evaluation.py         # 过敏原累积、规则/快照匹配、稳定排序输出（评估与整改共用内核）
     rule_sets.py          # ppm 归一化、重叠冲突检测、摘要与摘要哈希
-  routers/                # ingredients / rules / rule_sets / recipes / evaluations
-tests/                    # pytest（SQLite 内存库，91 个用例，含并发竞速与删除—同号重建回归）
+    remediation.py        # 整改预演：替代校验、子集搜索、唯一最省方案
+  routers/                # ingredients / rules / rule_sets / recipes / evaluations / remediations
+tests/                    # pytest（SQLite 内存库，110 个用例，含并发竞速、删除—同号重建与整改回归）
 examples/quickstart.sh    # 端到端 curl 示例（含规则集发布、冲突与快照重放）
 examples/concurrency_check.sh  # 并发复验：草稿写 vs 发布的原子胜负顺序
 Dockerfile / docker-compose.yml

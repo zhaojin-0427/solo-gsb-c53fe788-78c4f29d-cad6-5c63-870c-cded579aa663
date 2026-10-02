@@ -233,3 +233,38 @@ class EvaluationRequest(BaseModel):
     @classmethod
     def _norm_jurisdiction(cls, v: str) -> str:
         return normalize_jurisdiction(v)
+
+
+class SubstitutionItem(BaseModel):
+    """One candidate substitution: replace every occurrence of an ingredient
+    with a different, registered substitute at equal mass."""
+
+    ingredient: str
+    substitute: str
+
+    @field_validator("ingredient", "substitute")
+    @classmethod
+    def _norm_code(cls, v: str) -> str:
+        return normalize_code(v)
+
+
+class RemediationRequest(BaseModel):
+    """Allergen remediation dry-run against an immutable rule-set snapshot."""
+
+    recipe_code: str
+    recipe_version: int = Field(ge=1)
+    jurisdiction: str
+    rule_set_code: str
+    rule_set_version: int = Field(ge=1)
+    # At most one distinct substitute per ingredient.
+    substitutions: list[SubstitutionItem] = []
+
+    @field_validator("recipe_code", "rule_set_code")
+    @classmethod
+    def _norm_code(cls, v: str) -> str:
+        return normalize_code(v)
+
+    @field_validator("jurisdiction")
+    @classmethod
+    def _norm_jurisdiction(cls, v: str) -> str:
+        return normalize_jurisdiction(v)

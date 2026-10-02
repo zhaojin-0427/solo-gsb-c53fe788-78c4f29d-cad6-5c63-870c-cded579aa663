@@ -163,3 +163,21 @@ curl -fsS -X POST "$BASE/recipes/broken/versions/1/publish" >/dev/null
 curl -sS -X POST "$BASE/evaluations" \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: broken-1' \
   -d '{"recipe_code":"broken","recipe_version":1,"jurisdiction":"EU"}' | j || true
+
+echo "== 16. remediation dry-run against the immutable v1 snapshot (writes nothing) =="
+curl -fsS -X POST "$BASE/ingredients" -H 'Content-Type: application/json' \
+  -d '{"code":"rice_flour","name":"Rice Flour"}' >/dev/null
+curl -fsS -X POST "$BASE/remediations" -H 'Content-Type: application/json' -d '{
+  "recipe_code": "cake",
+  "recipe_version": 1,
+  "jurisdiction": "EU",
+  "rule_set_code": "eu-pack",
+  "rule_set_version": 1,
+  "substitutions": [{"ingredient": "wheat_flour", "substitute": "rice_flour"}]
+}' | python3 -c 'import sys,json; d=json.load(sys.stdin); print("status:", d["status"], "| plan:", d["plan"], "| violations before/after:", len(d["before"]["violations"]), len(d["after"]["violations"]))'
+
+echo "-- the dry-run created no evaluation history and changed no recipe --"
+curl -fsS "$BASE/evaluations?recipe_code=cake" \
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); print("stored cake evaluations:", len(d), "(only the ones from steps 10-13)")'
+curl -fsS "$BASE/recipes/cake/versions/1" \
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); print("cake v1 items still:", [i["code"] for i in d["items"]])'

@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from ..errors import api_error
 from ..models import Ingredient, Recipe, RecipeVersion, Rule, RuleSet
 from ..units import concentration_to_ppm
-from .expansion import CycleError, expand_root
+from .expansion import CycleError, Expansion, Leaf, expand_root
 
 
 def _r6(x: float) -> float:
@@ -99,13 +99,10 @@ def _classify(action: str, entry: dict, obligations: list, warnings: list, viola
         violations.append(entry)
 
 
-def evaluate_recipe(
-    db: Session,
-    recipe_code: str,
-    recipe_version: int,
-    jurisdiction: str,
-    binding: RuleSetBinding | None = None,
-) -> dict:
+def get_published_recipe_version(
+    db: Session, recipe_code: str, recipe_version: int
+) -> RecipeVersion:
+    """Fetch a published recipe version or raise the stable reference errors."""
     recipe = db.query(Recipe).filter(Recipe.code == recipe_code).first()
     if recipe is None:
         raise api_error(
@@ -133,7 +130,11 @@ def evaluate_recipe(
             "VERSION_NOT_PUBLISHED",
             f"recipe {recipe_code!r} version {recipe_version} is not published",
         )
+    return rv
 
+
+def expand_or_raise(db: Session, rv: RecipeVersion, recipe_code: str) -> Expansion:
+    """Expand a recipe version, mapping expansion failures to stable errors."""
     try:
         expansion = expand_root(db, rv, recipe_code)
     except CycleError as exc:
@@ -148,20 +149,76 @@ def evaluate_recipe(
         )
     if expansion.yield_g <= 0:
         raise api_error(422, "EMPTY_RECIPE", "recipe total mass is zero")
+    return expansion
 
-    codes = sorted({leaf.ingredient_code for leaf in expansion.leaves})
-    ingredients = (
-        {i.code: i for i in db.query(Ingredient).filter(Ingredient.code.in_(codes)).all()}
-        if codes
-        else {}
+
+def load_ingredients(db: Session, codes) -> dict[str, Ingredient]:
+    """Load registered ingredients by code; unknown codes are simply absent."""
+    codes = sorted(set(codes))
+    if not codes:
+        return {}
+    return {i.code: i for i in db.query(Ingredient).filter(Ingredient.code.in_(codes)).all()}
+
+
+def build_match_rules(
+    db: Session, jurisdiction: str, binding: RuleSetBinding | None
+) -> list[dict]:
+    """Uniform rule representation: ``{"code", "allergen", "action",
+    "applies_to", "threshold_ppm"}`` — already normalized when sourced from a
+    rule-set snapshot."""
+    if binding is not None:
+        return [
+            {
+                "code": r["code"],
+                "allergen": r["allergen"],
+                "action": r["action"],
+                "applies_to": r["applies_to"],
+                "threshold_ppm": _r6(r["threshold_ppm"]),
+            }
+            for r in sorted(binding.rules, key=lambda r: r["code"])
+        ]
+    rows = (
+        db.query(Rule)
+        .filter(Rule.jurisdiction == jurisdiction, Rule.status == "published")
+        .order_by(Rule.code)
+        .all()
     )
+    return [
+        {
+            "code": r.code,
+            "allergen": r.allergen,
+            "action": r.action,
+            "applies_to": r.applies_to,
+            "threshold_ppm": _r6(concentration_to_ppm(r.threshold, r.unit)),
+        }
+        for r in rows
+    ]
 
-    total = expansion.yield_g
+
+def evaluate_leaf_set(
+    *,
+    leaves: list[Leaf],
+    yield_g: float,
+    ingredients: dict[str, Ingredient],
+    match_rules: list[dict],
+    recipe_code: str,
+    recipe_version: int,
+    jurisdiction: str,
+    binding: RuleSetBinding | None,
+    resolved_recipes: list[dict],
+) -> dict:
+    """Evaluate an already-expanded leaf set against normalized rules.
+
+    Pure computation over the given leaves: every leaf code must be present in
+    ``ingredients``. Shared by the persisted evaluation endpoint and the
+    in-memory remediation dry-run.
+    """
+    total = yield_g
     contains_mass: dict[str, float] = defaultdict(float)
     contains_paths: dict[str, list[dict]] = defaultdict(list)
     cross_paths: dict[str, list[dict]] = defaultdict(list)
 
-    for leaf in expansion.leaves:
+    for leaf in leaves:
         ing = ingredients[leaf.ingredient_code]
         for content in ing.allergens:
             fraction = concentration_to_ppm(content["concentration"], content["unit"]) / 1e6
@@ -191,37 +248,6 @@ def evaluate_recipe(
     # Stable path ordering within each allergen.
     for paths in list(contains_paths.values()) + list(cross_paths.values()):
         paths.sort(key=lambda p: ("/".join(p["path"]), p["ingredient"]))
-
-    # Uniform rule representation: {"code", "allergen", "action", "applies_to",
-    # "threshold_ppm"} — already normalized when sourced from a rule-set snapshot.
-    if binding is not None:
-        match_rules = [
-            {
-                "code": r["code"],
-                "allergen": r["allergen"],
-                "action": r["action"],
-                "applies_to": r["applies_to"],
-                "threshold_ppm": _r6(r["threshold_ppm"]),
-            }
-            for r in sorted(binding.rules, key=lambda r: r["code"])
-        ]
-    else:
-        rows = (
-            db.query(Rule)
-            .filter(Rule.jurisdiction == jurisdiction, Rule.status == "published")
-            .order_by(Rule.code)
-            .all()
-        )
-        match_rules = [
-            {
-                "code": r.code,
-                "allergen": r.allergen,
-                "action": r.action,
-                "applies_to": r.applies_to,
-                "threshold_ppm": _r6(concentration_to_ppm(r.threshold, r.unit)),
-            }
-            for r in rows
-        ]
 
     obligations: list[dict] = []
     warnings: list[dict] = []
@@ -277,7 +303,7 @@ def evaluate_recipe(
         "rule_set": binding.reference if binding is not None else None,
         "status": "completed",
         "total_mass_g": _r6(total),
-        "resolved_recipes": expansion.resolved_recipes,
+        "resolved_recipes": resolved_recipes,
         "allergens": [
             {
                 "allergen": a,
@@ -291,3 +317,29 @@ def evaluate_recipe(
         "violations": violations,
         "unregulated_allergens": unregulated,
     }
+
+
+def evaluate_recipe(
+    db: Session,
+    recipe_code: str,
+    recipe_version: int,
+    jurisdiction: str,
+    binding: RuleSetBinding | None = None,
+) -> dict:
+    rv = get_published_recipe_version(db, recipe_code, recipe_version)
+    expansion = expand_or_raise(db, rv, recipe_code)
+    ingredients = load_ingredients(
+        db, {leaf.ingredient_code for leaf in expansion.leaves}
+    )
+    match_rules = build_match_rules(db, jurisdiction, binding)
+    return evaluate_leaf_set(
+        leaves=expansion.leaves,
+        yield_g=expansion.yield_g,
+        ingredients=ingredients,
+        match_rules=match_rules,
+        recipe_code=recipe_code,
+        recipe_version=recipe_version,
+        jurisdiction=jurisdiction,
+        binding=binding,
+        resolved_recipes=expansion.resolved_recipes,
+    )
