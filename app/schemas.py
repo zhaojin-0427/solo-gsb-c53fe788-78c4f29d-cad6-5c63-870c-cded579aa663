@@ -214,6 +214,44 @@ class RuleSetPublish(BaseModel):
     base_version: int = Field(ge=0)
 
 
+class RemediationSubstitution(BaseModel):
+    """One proposed equal-mass replacement: ingredient -> alternative."""
+
+    ingredient: str
+    alternative: str
+
+    @field_validator("ingredient", "alternative")
+    @classmethod
+    def _norm_code(cls, v: str) -> str:
+        return normalize_code(v)
+
+
+class RemediationRequest(BaseModel):
+    """Preview-only request: eliminate prohibit violations by substitution.
+
+    The request always binds a published recipe version to an immutable,
+    published rule-set snapshot of the same jurisdiction; the preview never
+    writes anything. Each ingredient may be mapped to at most one alternative.
+    """
+
+    recipe_code: str
+    recipe_version: int = Field(ge=1)
+    jurisdiction: str
+    rule_set_code: str
+    rule_set_version: int = Field(ge=1)
+    substitutions: list[RemediationSubstitution] = []
+
+    @field_validator("recipe_code", "rule_set_code")
+    @classmethod
+    def _norm_code(cls, v: str) -> str:
+        return normalize_code(v)
+
+    @field_validator("jurisdiction")
+    @classmethod
+    def _norm_jurisdiction(cls, v: str) -> str:
+        return normalize_jurisdiction(v)
+
+
 class EvaluationRequest(BaseModel):
     recipe_code: str
     recipe_version: int = Field(ge=1)

@@ -11,6 +11,11 @@ Rules come from one of two sources:
 - **Bound**: the immutable snapshot of a published rule-set version
   (``/rule-sets``), which makes the evaluation replayable against the exact
   same rules forever.
+
+The building blocks (``resolve_published_recipe``, ``build_match_rules``,
+``score_leaves``) are also reused by the remediation preview service, which
+re-scores in-memory substitution scenarios against the same engine so a
+preview can never drift from a real evaluation.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from sqlalchemy.orm import Session
 from ..errors import api_error
 from ..models import Ingredient, Recipe, RecipeVersion, Rule, RuleSet
 from ..units import concentration_to_ppm
-from .expansion import CycleError, expand_root
+from .expansion import CycleError, Expansion, expand_root
 
 
 def _r6(x: float) -> float:
@@ -90,22 +95,14 @@ def resolve_rule_set_binding(
     )
 
 
-def _classify(action: str, entry: dict, obligations: list, warnings: list, violations: list) -> None:
-    if action == "declare":
-        obligations.append(entry)
-    elif action == "warning":
-        warnings.append(entry)
-    else:  # prohibit
-        violations.append(entry)
+def resolve_published_recipe(
+    db: Session, recipe_code: str, recipe_version: int
+) -> tuple[Recipe, RecipeVersion]:
+    """Fetch a recipe version and require it to be published.
 
-
-def evaluate_recipe(
-    db: Session,
-    recipe_code: str,
-    recipe_version: int,
-    jurisdiction: str,
-    binding: RuleSetBinding | None = None,
-) -> dict:
+    Raises the same stable errors as ``POST /evaluations`` (unknown recipe /
+    version -> 404, draft version -> 422).
+    """
     recipe = db.query(Recipe).filter(Recipe.code == recipe_code).first()
     if recipe is None:
         raise api_error(
@@ -133,9 +130,13 @@ def evaluate_recipe(
             "VERSION_NOT_PUBLISHED",
             f"recipe {recipe_code!r} version {recipe_version} is not published",
         )
+    return recipe, rv
 
+
+def expand_published(db: Session, recipe: Recipe, rv: RecipeVersion) -> Expansion:
+    """Expand a published recipe version, surfacing the same stable errors."""
     try:
-        expansion = expand_root(db, rv, recipe_code)
+        expansion = expand_root(db, rv, recipe.code)
     except CycleError as exc:
         raise api_error(422, "RECIPE_CYCLE", "recipe graph contains a cycle", cycle=exc.cycle)
 
@@ -148,24 +149,103 @@ def evaluate_recipe(
         )
     if expansion.yield_g <= 0:
         raise api_error(422, "EMPTY_RECIPE", "recipe total mass is zero")
+    return expansion
 
-    codes = sorted({leaf.ingredient_code for leaf in expansion.leaves})
-    ingredients = (
-        {i.code: i for i in db.query(Ingredient).filter(Ingredient.code.in_(codes)).all()}
-        if codes
-        else {}
+
+def build_match_rules(
+    db: Session, jurisdiction: str, binding: RuleSetBinding | None
+) -> list[dict]:
+    """Uniform rule representation for the scoring engine.
+
+    ``{"code", "allergen", "action", "applies_to", "threshold_ppm"}`` —
+    already normalized when sourced from a rule-set snapshot.
+    """
+    if binding is not None:
+        return [
+            {
+                "code": r["code"],
+                "allergen": r["allergen"],
+                "action": r["action"],
+                "applies_to": r["applies_to"],
+                "threshold_ppm": _r6(r["threshold_ppm"]),
+            }
+            for r in sorted(binding.rules, key=lambda r: r["code"])
+        ]
+    rows = (
+        db.query(Rule)
+        .filter(Rule.jurisdiction == jurisdiction, Rule.status == "published")
+        .order_by(Rule.code)
+        .all()
     )
+    return [
+        {
+            "code": r.code,
+            "allergen": r.allergen,
+            "action": r.action,
+            "applies_to": r.applies_to,
+            "threshold_ppm": _r6(concentration_to_ppm(r.threshold, r.unit)),
+        }
+        for r in rows
+    ]
 
-    total = expansion.yield_g
+
+def allergen_fraction(content: dict) -> float:
+    """Convert an ingredient allergen marker to a 0..1 mass fraction."""
+    return concentration_to_ppm(content["concentration"], content["unit"]) / 1e6
+
+
+def load_ingredients(db: Session, codes: set[str]) -> dict[str, Ingredient]:
+    """Load the immutable ingredient rows keyed by code."""
+    if not codes:
+        return {}
+    return {
+        i.code: i
+        for i in db.query(Ingredient).filter(Ingredient.code.in_(tuple(sorted(codes)))).all()
+    }
+
+
+@dataclass(frozen=True)
+class Score:
+    """The deterministic outcome of scoring one concrete leaf set."""
+
+    total_mass_g: float
+    contains_mass: dict[str, float]
+    cross_paths: dict[str, list[dict]]
+    obligations: tuple[dict, ...]
+    warnings: tuple[dict, ...]
+    violations: tuple[dict, ...]
+    unregulated_allergens: tuple[str, ...]
+
+
+def _classify(action: str, entry: dict, obligations: list, warnings: list, violations: list) -> None:
+    if action == "declare":
+        obligations.append(entry)
+    elif action == "warning":
+        warnings.append(entry)
+    else:  # prohibit
+        violations.append(entry)
+
+
+def score_leaves(
+    leaves: list,
+    total_g: float,
+    ingredients: dict[str, Ingredient],
+    match_rules: list[dict],
+) -> Score:
+    """Aggregate allergens over a concrete leaf set and match the rules.
+
+    ``leaves`` are :class:`~app.services.expansion.Leaf`-like objects carrying
+    ``ingredient_code``, ``mass_g`` and ``path``; the code is looked up in
+    ``ingredients`` (an ingredient row with ``allergens``/``cross_contact``).
+    """
     contains_mass: dict[str, float] = defaultdict(float)
     contains_paths: dict[str, list[dict]] = defaultdict(list)
     cross_paths: dict[str, list[dict]] = defaultdict(list)
 
-    for leaf in expansion.leaves:
+    for leaf in leaves:
         ing = ingredients[leaf.ingredient_code]
         for content in ing.allergens:
-            fraction = concentration_to_ppm(content["concentration"], content["unit"]) / 1e6
-            allergen_mass = leaf.mass_g * fraction
+            allergen_mass = leaf.mass_g * allergen_fraction(content)
             if allergen_mass <= 0:
                 continue
             allergen = content["allergen"]
@@ -176,7 +256,7 @@ def evaluate_recipe(
                     "ingredient": leaf.ingredient_code,
                     "ingredient_mass_g": _r6(leaf.mass_g),
                     "allergen_mass_g": _r6(allergen_mass),
-                    "contribution_ppm": _r6(allergen_mass / total * 1e6),
+                    "contribution_ppm": _r6(allergen_mass / total_g * 1e6),
                 }
             )
         for cc in ing.cross_contact:
@@ -192,37 +272,6 @@ def evaluate_recipe(
     for paths in list(contains_paths.values()) + list(cross_paths.values()):
         paths.sort(key=lambda p: ("/".join(p["path"]), p["ingredient"]))
 
-    # Uniform rule representation: {"code", "allergen", "action", "applies_to",
-    # "threshold_ppm"} — already normalized when sourced from a rule-set snapshot.
-    if binding is not None:
-        match_rules = [
-            {
-                "code": r["code"],
-                "allergen": r["allergen"],
-                "action": r["action"],
-                "applies_to": r["applies_to"],
-                "threshold_ppm": _r6(r["threshold_ppm"]),
-            }
-            for r in sorted(binding.rules, key=lambda r: r["code"])
-        ]
-    else:
-        rows = (
-            db.query(Rule)
-            .filter(Rule.jurisdiction == jurisdiction, Rule.status == "published")
-            .order_by(Rule.code)
-            .all()
-        )
-        match_rules = [
-            {
-                "code": r.code,
-                "allergen": r.allergen,
-                "action": r.action,
-                "applies_to": r.applies_to,
-                "threshold_ppm": _r6(concentration_to_ppm(r.threshold, r.unit)),
-            }
-            for r in rows
-        ]
-
     obligations: list[dict] = []
     warnings: list[dict] = []
     violations: list[dict] = []
@@ -235,7 +284,7 @@ def evaluate_recipe(
             if mass is None:
                 continue
             regulated.add(rule["allergen"])
-            conc_ppm = mass / total * 1e6
+            conc_ppm = mass / total_g * 1e6
             if conc_ppm < threshold_ppm:
                 continue
             entry = {
@@ -269,25 +318,61 @@ def evaluate_recipe(
     violations.sort(key=sort_key)
 
     present = set(contains_mass) | set(cross_paths)
-    unregulated = sorted(present - regulated)
+    unregulated = tuple(sorted(present - regulated))
 
+    return Score(
+        total_mass_g=total_g,
+        contains_mass=dict(contains_mass),
+        cross_paths=dict(cross_paths),
+        obligations=tuple(obligations),
+        warnings=tuple(warnings),
+        violations=tuple(violations),
+        unregulated_allergens=unregulated,
+    )
+
+
+def serialize_score(score: Score) -> dict:
+    """Shape a :class:`Score` into the stable evaluation response payload."""
+    total = score.total_mass_g
     return {
-        "recipe": {"code": recipe_code, "version": recipe_version},
-        "jurisdiction": jurisdiction,
-        "rule_set": binding.reference if binding is not None else None,
         "status": "completed",
         "total_mass_g": _r6(total),
-        "resolved_recipes": expansion.resolved_recipes,
         "allergens": [
             {
                 "allergen": a,
-                "concentration_ppm": _r6(contains_mass[a] / total * 1e6),
-                "concentration_percent": _r6(contains_mass[a] / total * 100.0),
+                "concentration_ppm": _r6(score.contains_mass[a] / total * 1e6),
+                "concentration_percent": _r6(score.contains_mass[a] / total * 100.0),
             }
-            for a in sorted(contains_mass)
+            for a in sorted(score.contains_mass)
         ],
-        "obligations": obligations,
-        "warnings": warnings,
-        "violations": violations,
-        "unregulated_allergens": unregulated,
+        "obligations": list(score.obligations),
+        "warnings": list(score.warnings),
+        "violations": list(score.violations),
+        "unregulated_allergens": list(score.unregulated_allergens),
     }
+
+
+def evaluate_recipe(
+    db: Session,
+    recipe_code: str,
+    recipe_version: int,
+    jurisdiction: str,
+    binding: RuleSetBinding | None = None,
+) -> dict:
+    recipe, rv = resolve_published_recipe(db, recipe_code, recipe_version)
+    expansion = expand_published(db, recipe, rv)
+
+    ingredients = load_ingredients(
+        db, {leaf.ingredient_code for leaf in expansion.leaves}
+    )
+    match_rules = build_match_rules(db, jurisdiction, binding)
+    score = score_leaves(expansion.leaves, expansion.yield_g, ingredients, match_rules)
+
+    result = {
+        "recipe": {"code": recipe_code, "version": recipe_version},
+        "jurisdiction": jurisdiction,
+        "rule_set": binding.reference if binding is not None else None,
+        "resolved_recipes": expansion.resolved_recipes,
+    }
+    result.update(serialize_score(score))
+    return result

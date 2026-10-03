@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import inspect, text
 
 from .db import Base, engine
-from .routers import evaluations, ingredients, recipes, rule_sets, rules
+from .routers import evaluations, ingredients, recipes, remediations, rule_sets, rules
 from .units import CONCENTRATION_TO_PPM, MASS_TO_GRAMS
 
 # Lightweight additive migration for databases created before rule sets existed:
@@ -39,12 +39,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Food Allergen Recipe Compliance API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Register immutable ingredients, jurisdiction threshold rules and versioned "
         "nested recipes; publish traceable, versioned per-jurisdiction rule sets; "
         "evaluate recipes for allergen labeling obligations, warnings and threshold "
-        "violations with idempotent, replayable requests bound to immutable snapshots."
+        "violations with idempotent, replayable requests bound to immutable snapshots; "
+        "preview minimum-mass equal-weight substitutions that remove prohibit "
+        "violations without changing any stored data."
     ),
     lifespan=lifespan,
 )
@@ -72,7 +74,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 def root():
     return {
         "service": "food-allergen-compliance",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "docs": "/docs",
         "endpoints": [
             "/ingredients",
@@ -80,6 +82,7 @@ def root():
             "/rule-sets",
             "/recipes",
             "/evaluations",
+            "/remediations",
             "/units",
             "/health",
         ],
@@ -104,3 +107,4 @@ app.include_router(rules.router)
 app.include_router(rule_sets.router)
 app.include_router(recipes.router)
 app.include_router(evaluations.router)
+app.include_router(remediations.router)

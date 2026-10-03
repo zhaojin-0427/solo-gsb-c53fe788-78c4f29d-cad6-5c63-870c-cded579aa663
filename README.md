@@ -12,6 +12,10 @@
   标签义务（obligations）、警告（warnings）与违规（violations）
 - 评估请求**绑定配方版本**，并可显式绑定 `rule_set_code/version`，
   在不可变规则快照上**重放**；通过幂等键支持**幂等重放**
+- **过敏原整改预演**：对每种原料至多提议一项替代原料，服务沿同一展开引擎
+  取得叶子用量，在内存中按原料代码**等质量替换全部出现位置**并用指定规则
+  快照重算，返回消除全部 `prohibit` 违规的**唯一最小替换质量**方案、替换总
+  质量及整改前后的义务/警告/违规；预演**不写入任何数据**
 - 输入不完整时返回**最小缺失集合**（minimal missing set）
 
 ---
@@ -320,7 +324,138 @@ curl -X POST http://localhost:8000/evaluations \
 {"detail": {"code": "RECIPE_CYCLE", "cycle": ["a@v1", "b@v1", "a@v1"], "message": "..."}}
 ```
 
-### 3.8 并发复验：草稿写与发布的原子胜负
+### 3.8 配方过敏原整改预演（`POST /remediations`）
+
+整改预演回答：**“在不改写已发布配方的前提下，用给定的替代原料怎样才能消除
+全部 `prohibit` 违规？”** 请求给出法域、**已发布**配方版本与**已发布规则集
+快照**（`rule_set_code` + `rule_set_version`，二者必须同属该法域），以及每种
+原料**至多一项**替代原料：
+
+```bash
+curl -X POST http://localhost:8000/remediations \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "recipe_code": "loaf",
+        "recipe_version": 1,
+        "jurisdiction": "EU",
+        "rule_set_code": "eu-pack",
+        "rule_set_version": 1,
+        "substitutions": [
+          {"ingredient": "wheat_flour", "alternative": "rice_flour"}
+        ]
+      }'
+```
+
+服务端流程：
+
+1. 沿**与评估完全相同**的嵌套展开逻辑取得叶子用量（单位换算、子配方缩放、
+   循环/缺失引用检测，错误响应也与评估一致）；
+2. 在**内存中**把被映射原料代码的**每一处叶子出现位置**等质量替换为替代原料
+   （批次产出与总质量不变；路径叶子名同步改为替代原料）；
+3. 用**同一个评分引擎**和绑定的规则快照重算含量、交叉接触与合规结果；
+4. 在提议映射的全部子集上做穷举搜索，选出**唯一**方案：先按**替换总质量最小**，
+   质量相同再按**已排序替换对的代码字典序**（如 `("a","c") < ("b",)`）。
+
+响应的 `status` 有三种：
+
+| status | 含义 | `plan` / `after` |
+| ---- | ---- | ---- |
+| `remediated` | 找到消除全部 prohibit 的方案 | 方案 + 整改后结果 |
+| `already_compliant` | 原配方本就没有 prohibit 违规 | 空方案 `[]`，`after` 等于原评估 |
+| `no_solution` | 所有提议组合都无法消除全部 prohibit | `null` / `null`（HTTP 仍为 **200**） |
+
+下面是与实现**逐字一致**的真实响应（1 kg 含 10% 麸质的小麦面包，规则
+declare@0ppm + prohibit@20ppm，改用无麸质米粉）：
+
+```json
+{
+  "recipe": {"code": "loaf", "version": 1},
+  "jurisdiction": "EU",
+  "rule_set": {"code": "eu-pack", "version": 1,
+               "digest": "45bfe01d3fdba992895d97873e7c9da173828e17aba7a4c45e065169b2e3919b"},
+  "resolved_recipes": [{"code": "loaf", "version": 1}],
+  "status": "remediated",
+  "plan": [
+    {"ingredient": "wheat_flour", "alternative": "rice_flour", "replaced_mass_g": 1000.0}
+  ],
+  "replaced_total_mass_g": 1000.0,
+  "before": {
+    "recipe": {"code": "loaf", "version": 1},
+    "jurisdiction": "EU",
+    "rule_set": {"code": "eu-pack", "version": 1,
+                 "digest": "45bfe01d3fdba992895d97873e7c9da173828e17aba7a4c45e065169b2e3919b"},
+    "status": "completed",
+    "total_mass_g": 1000.0,
+    "allergens": [
+      {"allergen": "gluten", "concentration_ppm": 100000.0, "concentration_percent": 10.0}
+    ],
+    "obligations": [
+      {"allergen": "gluten", "rule_code": "gluten-declare", "action": "declare",
+       "source": "contains", "threshold_ppm": 0.0, "concentration_ppm": 100000.0,
+       "trigger_paths": [
+         {"path": ["loaf@v1", "wheat_flour"], "ingredient": "wheat_flour",
+          "ingredient_mass_g": 1000.0, "allergen_mass_g": 100.0,
+          "contribution_ppm": 100000.0}
+       ]}
+    ],
+    "warnings": [],
+    "violations": [
+      {"allergen": "gluten", "rule_code": "gluten-prohibit", "action": "prohibit",
+       "source": "contains", "threshold_ppm": 20.0, "concentration_ppm": 100000.0,
+       "trigger_paths": [
+         {"path": ["loaf@v1", "wheat_flour"], "ingredient": "wheat_flour",
+          "ingredient_mass_g": 1000.0, "allergen_mass_g": 100.0,
+          "contribution_ppm": 100000.0}
+       ]}
+    ],
+    "unregulated_allergens": []
+  },
+  "after": {
+    "recipe": {"code": "loaf", "version": 1},
+    "jurisdiction": "EU",
+    "rule_set": {"code": "eu-pack", "version": 1,
+                 "digest": "45bfe01d3fdba992895d97873e7c9da173828e17aba7a4c45e065169b2e3919b"},
+    "status": "completed",
+    "total_mass_g": 1000.0,
+    "allergens": [],
+    "obligations": [],
+    "warnings": [],
+    "violations": [],
+    "unregulated_allergens": []
+  }
+}
+```
+
+无解时（如唯一替代原料燕麦仍含 50 ppm 麸质）返回 **200**：
+
+```json
+{"status": "no_solution", "plan": null, "replaced_total_mass_g": 0.0, "after": null}
+```
+
+非法原料映射一律 **422**（`ingredients` 为按字典序稳定排序的代码清单）：
+
+| 情况 | `detail.code` |
+| ---- | ---- |
+| 同一原料给出多于一项映射（即使目标相同） | `DUPLICATE_SUBSTITUTION` |
+| 原料映射为它自身 | `SAME_SUBSTITUTION` |
+| 替代原料未登记 | `UNKNOWN_ALTERNATIVE_INGREDIENT` |
+| 被替换原料未在配方叶子中出现 | `SUBSTITUTION_SOURCE_NOT_USED` |
+
+配方或规则集引用错误**沿用评估的既有响应**：`RULE_SET_NOT_FOUND`(404)、
+`RULE_SET_VERSION_NOT_FOUND`(404)、`RULE_SET_JURISDICTION_MISMATCH`(422)、
+`RECIPE_NOT_FOUND`(404)、`RECIPE_VERSION_NOT_FOUND`(404)、
+`VERSION_NOT_PUBLISHED`(422)、`INCOMPLETE_INPUT`(422，最小缺失集合)、
+`RECIPE_CYCLE`(422)。
+
+预演是**纯只读**操作：不创建配方版本、不改规则集、也不产生评估历史行；
+因此**不需要幂等键**，原评估的首次创建与幂等重放行为完全不变。可直接运行
+端到端脚本：
+
+```bash
+bash examples/remediation.sh
+```
+
+### 3.9 并发复验：草稿写与发布的原子胜负
 
 配方版本的草稿替换（`PUT`）、删除（`DELETE`）与发布（`publish`）在**数据库层**
 以版本状态原子地决定胜负：三个写操作都是带 `status = 'draft'` 守卫、且**按最初
@@ -446,6 +581,7 @@ bash examples/concurrency_check.sh # 默认 10 轮 × 3 组竞速，可用 ROUND
 | GET  | `/recipes…` | 查询配方及版本 |
 | POST | `/evaluations` | 评估（需 `Idempotency-Key` 头或 `idempotency_key`；可选 `rule_set_code`+`rule_set_version`） |
 | GET  | `/evaluations`、`/evaluations/{id}` | 查询（可按 `rule_set_code`/`rule_set_version` 过滤，固定返回摘要、配方版本与结果） |
+| POST | `/remediations` | 过敏原整改预演（只读：最小替换质量的等质量替代方案，绑定规则集快照；无解 200 `no_solution`） |
 | GET  | `/units`、`/health`、`/` | 元信息 |
 
 ## 5. 评估语义
@@ -462,6 +598,12 @@ bash examples/concurrency_check.sh # 默认 10 轮 × 3 组竞速，可用 ROUND
    按 `action` 分别归入 obligations / warnings / violations。
 5. **未监管过敏原**：配方中存在但法域无任何已发布规则覆盖的过敏原，列入
    `unregulated_allergens`，不阻断评估。
+6. **整改选择**：整改预演在提议映射的幂集上穷举；方案“可行”当且仅当整改后
+   不存在任何 `prohibit` 命中（`contains` 浓度 `≥` 阈值即命中，阈值边界与
+   评估一致；`cross_contact` 存在贡献叶子即命中）。最优方案先最小化替换总
+   质量，再按已排序 `(原料, 替代原料)` 对的字典序唯一确定；原配方已合规时
+   唯一方案为空方案。判定时按叶子逐片重算（与评分引擎同一算术），避免浮点
+   误差在阈值边界产生分歧。
 
 ## 6. 规则集语义（可追溯）
 
@@ -519,6 +661,11 @@ uvicorn app.main:app --reload
   旧结果仅新增恒定为 `null` 的 `rule_set` 字段。升级时自动为已有库补齐新列。
 - **最小缺失集合**：展开过程收集全部直接缺失引用（去重、稳定排序）后一次性
   返回 `422 INCOMPLETE_INPUT`；失败评估不占用幂等键。
+- **整改预演只读**：`/remediations` 复用展开与评分引擎，在内存中按原料代码
+  等质量改写全部叶子出现位置后重算；在映射幂集上穷举，按“替换总质量最小、
+  再按已排序替换对字典序”返回唯一方案，原配方已合规则返回零替换方案，无解
+  返回 `200 status=no_solution`。预演不触碰配方、规则集与评估表，也不使用
+  幂等键；原评估与幂等重放行为保持不变。
 - **稳定输出**：所有列表确定性排序，数值统一 `round(., 6)`，便于审计与 diff。
 
 ## 9. 目录结构
@@ -532,11 +679,13 @@ app/
   units.py                # 质量(g)与浓度(ppm)换算
   services/
     expansion.py          # 递归展开、循环检测、最小缺失集合
-    evaluation.py         # 过敏原累积、规则/快照匹配、稳定排序输出
+    evaluation.py         # 过敏原累积、规则/快照匹配、稳定排序输出（评估与整改共用）
+    remediation.py        # 等质量替换的最小质量整改搜索（只读预演）
     rule_sets.py          # ppm 归一化、重叠冲突检测、摘要与摘要哈希
-  routers/                # ingredients / rules / rule_sets / recipes / evaluations
-tests/                    # pytest（SQLite 内存库，91 个用例，含并发竞速与删除—同号重建回归）
+  routers/                # ingredients / rules / rule_sets / recipes / evaluations / remediations
+tests/                    # pytest（SQLite 内存库，118 个用例，含并发竞速与删除—同号重建回归）
 examples/quickstart.sh    # 端到端 curl 示例（含规则集发布、冲突与快照重放）
+examples/remediation.sh   # 整改预演端到端 curl 示例（方案、无解与 422）
 examples/concurrency_check.sh  # 并发复验：草稿写 vs 发布的原子胜负顺序
 Dockerfile / docker-compose.yml
 ```
